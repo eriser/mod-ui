@@ -3,8 +3,9 @@
 
 import json
 import os
+import socket
 
-from tornado import gen
+from tornado import gen, iostream
 from mod import get_hardware_actuators, safe_json_load
 from mod.utils import get_plugin_info, get_plugin_control_inputs_and_monitored_outputs
 
@@ -47,6 +48,18 @@ class Addressings(object):
         self._task_get_port_value = None
         self._task_store_address_data = None
 
+        if not os.path.exists("/data/control-chain-enabled"):
+            return
+
+        print("ControlChain enabled")
+        self.cc_crashed   = False
+        self.cc_connected = False
+
+        self.cc_socket = iostream.IOStream(socket.socket(socket.AF_UNIX, socket.SOCK_STREAM))
+        self.cc_socket.set_close_callback(self.cc_connection_closed)
+        self.cc_socket.set_nodelay(True)
+        self.cc_socket.connect("/tmp/control-chain.sock", self.cc_connection_started)
+
         # TODO: remove this
         if os.getenv("CONTROL_CHAIN_TEST"):
             dev_label = "footex"
@@ -64,6 +77,26 @@ class Addressings(object):
                     'steps': [],
                     'max_assigns': 1,
                 }
+
+    def cc_connection_started(self):
+        self.cc_connected = True
+        self.cc_process_read_queue()
+
+    def cc_connection_closed(self):
+        self.cc_socket = None
+        self.cc_crashed = True
+
+    def cc_process_read_queue(self):
+        def check_message(msg):
+            msg = msg[:-1].decode("utf-8", errors="ignore")
+            print("[controlchain] received <- %s" % repr(msg))
+
+            self.cc_process_read_queue()
+
+        if self.cc_socket is None:
+            return
+
+        self.cc_socket.read_until(b"event", check_message)
 
     # -----------------------------------------------------------------------------------------------------------------
 
