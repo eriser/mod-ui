@@ -3,8 +3,9 @@
 
 import json
 import os
+import socket
 
-from tornado import gen
+from tornado import gen, iostream
 from mod import get_hardware_actuators, safe_json_load
 from mod.utils import get_plugin_info, get_plugin_control_inputs_and_monitored_outputs
 
@@ -47,23 +48,107 @@ class Addressings(object):
         self._task_get_port_value = None
         self._task_store_address_data = None
 
-        # TODO: remove this
-        if os.getenv("CONTROL_CHAIN_TEST"):
-            dev_label = "footex"
-            dev_id    = 1
+        if not os.path.exists("/data/control-chain-enabled"):
+            return
 
-            for actuator_id in range(4):
-                actuator_uri  = "/cc/%d/%d" % (dev_id, actuator_id)
-                actuator_name = "Footex %d:%d" % (dev_id, actuator_id+1),
+        print("ControlChain enabled")
+        self.cc_crashed   = False
+        self.cc_connected = False
+        self.cc_queue = []
+        self.cc_idle = False
 
-                self.cc_addressings[actuator_uri] = []
-                self.cc_metadata[actuator_uri] = {
-                    'hw_id': (dev_id, actuator_id),
-                    'name' : actuator_name,
-                    'modes': ":trigger:toggled:",
-                    'steps': [],
-                    'max_assigns': 1,
-                }
+        self.cc_socket = iostream.IOStream(socket.socket(socket.AF_UNIX, socket.SOCK_STREAM))
+        self.cc_socket.set_close_callback(self.cc_connection_closed)
+        self.cc_socket.set_nodelay(True)
+        self.cc_socket.connect("/tmp/control-chain.sock", self.cc_connection_started)
+
+        pending_devs = []
+        def device_list(dev_list):
+            dev_count = len(dev_list)
+
+            for dev_id in dev_list:
+                def device_descriptor(dev):
+                    print(dev)
+                    pending_devs.remove(dev_id)
+
+                    for actuator in dev['actuators']:
+                        uri = "/cc/%s-%i/%i" % (dev['label'], dev_id, actuator['id'])
+                        self.cc_metadata[uri] = {
+                            'uri'  : uri,
+                            'hw_id': (dev_id, actuator['id']),
+                            # FIXME
+                            'name' : dev['label'] + " " + str(actuator['id']+1),
+                            'modes': ":bypass:trigger:toggled:",
+                            'steps': [],
+                            'max_assigns': 1,
+                        }
+                        self.cc_addressings[uri] = []
+
+                    if len(pending_devs) == 0:
+                        print("FINAL")
+                        self.cc_send_request('device_status', {'enable':1})
+
+                pending_devs.append(dev_id)
+                self.cc_send_request("device_descriptor", {'device_id':dev_id}, device_descriptor)
+
+        self.cc_send_request("device_list", None, device_list)
+
+    # -----------------------------------------------------------------------------------------------------------------
+
+    def cc_connection_started(self):
+        self.cc_connected = True
+
+        if len(self.cc_queue):
+            self.cc_process_write_queue()
+        else:
+            self.cc_idle = True
+
+    def cc_connection_closed(self):
+        self.cc_socket = None
+        self.cc_crashed = True
+
+    def cc_process_write_queue(self):
+        try:
+            to_send, request_name, callback = self.cc_queue.pop(0)
+        except IndexError:
+            self.cc_idle = True
+            return
+
+        if self.cc_socket is None:
+            self.cc_process_write_queue()
+            return
+
+        def check_response(resp):
+            if callback is not None:
+                try:
+                    data = json.loads(resp[:-1].decode("utf-8", errors="ignore"))
+                except:
+                    data = None
+                else:
+                    if data is not None and data['reply'] != request_name:
+                        print("[control-chain] reply name mismatch")
+                        data = None
+
+                if data is not None:
+                    callback(data['data'])
+
+            self.cc_process_write_queue()
+
+        self.cc_idle = False
+        self.cc_socket.write(to_send)
+        self.cc_socket.read_until(b"\0", check_response)
+
+    def cc_send_request(self, request_name, request_data=None, callback=None):
+        request = {
+            'request': request_name,
+            'data'   : request_data
+        }
+
+        to_send = bytes(json.dumps(request).encode('utf-8')) + b'\x00'
+        self.cc_queue.append((to_send, request_name, callback))
+
+        if self.cc_idle:
+            self.cc_process_write_queue()
 
     # -----------------------------------------------------------------------------------------------------------------
 
